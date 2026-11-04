@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Temporary office lock files
+~$*
+*.tmp
+
 # Virtual environments
 venv/
 .venv/
