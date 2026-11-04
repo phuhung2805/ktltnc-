@@ -9,7 +9,7 @@
 [![Dependencies: Zero](https://img.shields.io/badge/Dependencies-Zero%20External-success.svg)](#)
 
 > **Môn học:** Kỹ thuật Lập trình Nâng cao (KTLTNC)  
-> **Sinh viên thực hiện:** Lê Phú Hưng ([@phuhung2805](https://github.com/phuhung2805))  
+> **Sinh viên thực hiện:** Nguyễn Phú Hưng ([@phuhung2805](https://github.com/phuhung2805))  
 > **Báo cáo chuyên môn (Word & Markdown):**
 > - 📄 **Tệp Báo cáo Word hoàn chỉnh (.docx):** [`BAO_CAO_MON_HOC_KTLTNC_QUAN_LY_LICH.docx`](BAO_CAO_MON_HOC_KTLTNC_QUAN_LY_LICH.docx)
 > - 📝 **Tệp Báo cáo Lý thuyết & Thực nghiệm (.md):** [`BAO_CAO_LY_THUYET_VA_THUC_NGHIEM.md`](BAO_CAO_LY_THUYET_VA_THUC_NGHIEM.md)
