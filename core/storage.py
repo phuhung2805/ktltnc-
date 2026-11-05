@@ -9,6 +9,7 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 from core.models import Task, Priority, Status, Category
+from core.scheduler_engine import SchedulerEngine
 
 
 class StorageManager:
@@ -19,9 +20,15 @@ class StorageManager:
         self.db_path = db_path
         self._init_db()
 
-    def _execute_write(self, func):
+    def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # SQLite mặc định tắt khóa ngoại trên từng kết nối
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _execute_write(self, func):
+        conn = self._connect()
         try:
             with conn:
                 return func(conn)
@@ -29,8 +36,7 @@ class StorageManager:
             conn.close()
 
     def _execute_read(self, func):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = self._connect()
         try:
             return func(conn)
         finally:
@@ -63,36 +69,73 @@ class StorageManager:
                     FOREIGN KEY (prerequisite_id) REFERENCES tasks(id) ON DELETE CASCADE
                 )
             """)
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_start_time ON tasks(start_time)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dependencies_prerequisite ON task_dependencies(prerequisite_id)")
         self._execute_write(_action)
+
+    @staticmethod
+    def _write_task_row(conn: sqlite3.Connection, task: Task):
+        # Dùng UPSERT thay cho INSERT OR REPLACE: REPLACE xóa dòng cũ, kéo theo ON DELETE CASCADE
+        # làm mất quan hệ phụ thuộc của các công việc khác trỏ tới công việc này.
+        conn.execute("""
+            INSERT INTO tasks
+            (id, title, description, category, priority, status, start_time, end_time, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                category = excluded.category,
+                priority = excluded.priority,
+                status = excluded.status,
+                start_time = excluded.start_time,
+                end_time = excluded.end_time,
+                created_at = excluded.created_at
+        """, (
+            task.id,
+            task.title,
+            task.description,
+            task.category,
+            task.priority.name,
+            task.status.name,
+            task.start_time.strftime("%Y-%m-%d %H:%M"),
+            task.end_time.strftime("%Y-%m-%d %H:%M"),
+            task.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        ))
+
+    @staticmethod
+    def _write_task_dependencies(conn: sqlite3.Connection, task: Task):
+        conn.execute("DELETE FROM task_dependencies WHERE task_id = ?", (task.id,))
+        for dep_id in task.dependencies:
+            conn.execute("""
+                INSERT OR IGNORE INTO task_dependencies (task_id, prerequisite_id)
+                VALUES (?, ?)
+            """, (task.id, dep_id))
 
     def save_task(self, task: Task) -> bool:
         """Thêm mới hoặc cập nhật một công việc."""
         def _action(conn):
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO tasks 
-                (id, title, description, category, priority, status, start_time, end_time, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                task.id,
-                task.title,
-                task.description,
-                task.category,
-                task.priority.name,
-                task.status.name,
-                task.start_time.strftime("%Y-%m-%d %H:%M"),
-                task.end_time.strftime("%Y-%m-%d %H:%M"),
-                task.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            ))
-
-            cursor.execute("DELETE FROM task_dependencies WHERE task_id = ?", (task.id,))
-            for dep_id in task.dependencies:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO task_dependencies (task_id, prerequisite_id)
-                    VALUES (?, ?)
-                """, (task.id, dep_id))
+            self._write_task_row(conn, task)
+            self._write_task_dependencies(conn, task)
             return True
         return self._execute_write(_action)
+
+    def save_tasks(self, tasks: List[Task], clear_existing: bool = False) -> None:
+        """
+        Lưu nhiều công việc trong một giao dịch: lỗi ở bất kỳ đâu thì không ghi gì cả.
+        Ghi toàn bộ công việc trước rồi mới ghi quan hệ phụ thuộc, nên thứ tự danh sách không quan trọng.
+        """
+        def _action(conn):
+            if clear_existing:
+                conn.execute("DELETE FROM task_dependencies")
+                conn.execute("DELETE FROM tasks")
+            for task in tasks:
+                self._write_task_row(conn, task)
+            for task in tasks:
+                self._write_task_dependencies(conn, task)
+        self._execute_write(_action)
 
     def delete_task(self, task_id: str) -> bool:
         """Xóa một công việc theo ID."""
@@ -176,25 +219,36 @@ class StorageManager:
         return True
 
     def import_from_json(self, file_path: str, clear_existing: bool = False) -> int:
-        """Nhập danh sách công việc từ tệp JSON."""
+        """
+        Nhập danh sách công việc từ tệp JSON. Dữ liệu được kiểm tra toàn bộ trước khi ghi:
+        tệp sai định dạng, phụ thuộc vào mã không tồn tại hoặc có chu trình đều ném ValueError
+        và không làm thay đổi dữ liệu đang có.
+        """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Tệp không tồn tại: {file_path}")
 
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        if clear_existing:
-            def _clear(conn):
-                conn.execute("DELETE FROM task_dependencies")
-                conn.execute("DELETE FROM tasks")
-            self._execute_write(_clear)
+        if not isinstance(data, list):
+            raise ValueError("Tệp JSON phải chứa một danh sách công việc.")
 
-        count = 0
-        for item in data:
-            task = Task.from_dict(item)
-            self.save_task(task)
-            count += 1
-        return count
+        try:
+            imported = [Task.from_dict(item) for item in data]
+        except (KeyError, TypeError, AttributeError) as e:
+            raise ValueError(f"Dữ liệu công việc trong tệp không hợp lệ: {e}")
+
+        merged = {} if clear_existing else {t.id: t for t in self.load_all_tasks()}
+        merged.update({t.id: t for t in imported})
+
+        for task in imported:
+            missing = [d for d in task.dependencies if d not in merged]
+            if missing:
+                raise ValueError(f"Công việc '{task.title}' phụ thuộc vào mã không tồn tại: {', '.join(missing)}")
+        SchedulerEngine.topological_sort(list(merged.values()))
+
+        self.save_tasks(imported, clear_existing=clear_existing)
+        return len(imported)
 
     def seed_sample_data(self, base_date: Optional[datetime] = None) -> List[Task]:
         """Tạo dữ liệu thử nghiệm phong phú phản ánh thực tế học tập và làm việc."""
@@ -273,7 +327,7 @@ class StorageManager:
             Task(
                 id="T07",
                 title="Thiết kế giao diện người dùng GUI Tkinter",
-                description="Xây dựng bảng Kanban, ma trận Eisenhower và biểu đồ thống kê",
+                description="Xây dựng lịch tuần, ma trận Eisenhower và biểu đồ thống kê",
                 category="Công việc",
                 priority=Priority.HIGH,
                 status=Status.PENDING,
@@ -327,7 +381,6 @@ class StorageManager:
             )
         ]
 
-        for t in sample_tasks:
-            self.save_task(t)
+        self.save_tasks(sample_tasks)
 
         return sample_tasks

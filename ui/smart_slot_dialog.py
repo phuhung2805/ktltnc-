@@ -1,16 +1,23 @@
 """
 ui/smart_slot_dialog.py
-Hộp thoại gợi ý khung thời gian rảnh thông minh (Smart Free Slot Finder).
-Cho phép người dùng chọn tiêu chí (Sớm nhất / Tối ưu diện tích Best-Fit) và áp dụng ngay.
+Hộp thoại tìm khung giờ rảnh (Smart Free Slot Finder).
+Kết quả cập nhật ngay khi đổi điều kiện, dòng được chọn sẵn là khe theo chiến lược người dùng chọn.
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 from datetime import datetime, timedelta
-from typing import List, Callable, Optional, Tuple
+from typing import List, Callable, Optional
 from core.models import Task
-from core.scheduler_engine import SchedulerEngine, FreeTimeSlot
+from core.scheduler_engine import SchedulerEngine
 from ui.theme import Theme
+from ui.widgets import DatePicker, make_button, make_modal, next_round_time, format_duration, set_button_enabled
+
+DURATION_VALUES = ["15", "30", "45", "60", "90", "120", "180"]
+STRATEGIES = [
+    ("earliest", "Sớm nhất có thể"),
+    ("best_fit", "Vừa khít nhất (giữ lại các khoảng trống dài)")
+]
 
 
 class SmartSlotDialog(tk.Toplevel):
@@ -24,224 +31,176 @@ class SmartSlotDialog(tk.Toplevel):
         self.parent = parent
         self.all_tasks = all_tasks
         self.on_slot_selected = on_slot_selected
+        self.found_slots = []
+        self.duration = 60
 
-        self.title("⚡ Gợi ý khung giờ rảnh thông minh")
-        self.geometry("620x580")
+        self.title("Tìm giờ rảnh")
         self.resizable(False, False)
-        self.configure(bg=Theme.BG_DARK)
-
-        self.transient(parent)
-        self.grab_set()
+        self.configure(bg=Theme.SURFACE)
 
         self._build_ui()
+        make_modal(self, parent)
 
     def _build_ui(self):
-        container = tk.Frame(self, bg=Theme.BG_DARK, padx=20, pady=16)
+        container = tk.Frame(self, bg=Theme.SURFACE, padx=22, pady=18)
         container.pack(fill=tk.BOTH, expand=True)
 
-        # Tiêu đề
+        tk.Label(container, text="Tìm giờ rảnh", font=Theme.FONT_TITLE, fg=Theme.TEXT, bg=Theme.SURFACE).pack(anchor="w")
         tk.Label(
             container,
-            text="TÌM & GỢI Ý KHUNG GIỜ LÀM VIỆC TỐI ƯU",
-            font=Theme.FONT_TITLE,
-            fg=Theme.PRIMARY,
-            bg=Theme.BG_DARK
-        ).pack(anchor="w", pady=(0, 12))
-
-        tk.Label(
-            container,
-            text="Thuật toán sẽ tự động phân tích các khoảng bận và tìm khe thời gian rảnh thích hợp nhất.",
+            text="Cho biết ngày và thời lượng cần, chương trình sẽ tìm các khoảng còn trống.",
             font=Theme.FONT_SMALL,
             fg=Theme.TEXT_MUTED,
-            bg=Theme.BG_DARK
-        ).pack(anchor="w", pady=(0, 14))
+            bg=Theme.SURFACE
+        ).pack(anchor="w", pady=(2, 12))
 
-        # Panel thông số đầu vào
-        param_frame = tk.Frame(container, bg=Theme.BG_CARD, padx=14, pady=12, highlightthickness=1, highlightbackground=Theme.BORDER)
-        param_frame.pack(fill=tk.X, pady=(0, 14))
+        params = tk.Frame(container, bg=Theme.SURFACE)
+        params.pack(fill=tk.X)
 
-        # Hàng 1: Ngày cần tìm & Thời lượng
-        r1 = tk.Frame(param_frame, bg=Theme.BG_CARD)
-        r1.pack(fill=tk.X, pady=(0, 8))
+        self._param_label(params, "Ngày", 0)
+        self.date_picker = DatePicker(params, datetime.now().date(), self._find_slots)
+        self.date_picker.grid(row=0, column=1, sticky="w", pady=3)
 
-        c1 = tk.Frame(r1, bg=Theme.BG_CARD)
-        c1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        tk.Label(c1, text="Ngày làm việc (YYYY-MM-DD):", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_CARD).pack(anchor="w")
-        self.ent_date = tk.Entry(c1, font=Theme.FONT_BODY, bg=Theme.BG_INPUT, fg=Theme.TEXT_MAIN, insertbackground=Theme.TEXT_MAIN, relief="flat")
-        self.ent_date.pack(fill=tk.X, pady=(4, 0), ipady=3)
-        self.ent_date.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        self._param_label(params, "Thời lượng", 1)
+        dur_row = tk.Frame(params, bg=Theme.SURFACE)
+        dur_row.grid(row=1, column=1, sticky="w", pady=3)
+        self.cb_duration = ttk.Combobox(dur_row, values=DURATION_VALUES, width=6, font=Theme.FONT_BODY)
+        self.cb_duration.set("60")
+        self.cb_duration.pack(side=tk.LEFT)
+        tk.Label(dur_row, text="phút", font=Theme.FONT_BODY, fg=Theme.TEXT, bg=Theme.SURFACE).pack(side=tk.LEFT, padx=6)
+        self.cb_duration.bind("<<ComboboxSelected>>", lambda e: self._find_slots())
+        self.cb_duration.bind("<KeyRelease>", lambda e: self._find_slots())
 
-        c2 = tk.Frame(r1, bg=Theme.BG_CARD)
-        c2.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
-        tk.Label(c2, text="Thời lượng cần (phút):", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_CARD).pack(anchor="w")
-        self.ent_dur = tk.Entry(c2, font=Theme.FONT_BODY, bg=Theme.BG_INPUT, fg=Theme.TEXT_MAIN, insertbackground=Theme.TEXT_MAIN, relief="flat")
-        self.ent_dur.pack(fill=tk.X, pady=(4, 0), ipady=3)
-        self.ent_dur.insert(0, "60")
-
-        # Hàng 2: Khung giờ & Chiến lược
-        r2 = tk.Frame(param_frame, bg=Theme.BG_CARD)
-        r2.pack(fill=tk.X)
-
-        c3 = tk.Frame(r2, bg=Theme.BG_CARD)
-        c3.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        tk.Label(c3, text="Khung giờ trong ngày (Từ - Đến):", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_CARD).pack(anchor="w")
-        sub_r = tk.Frame(c3, bg=Theme.BG_CARD)
-        sub_r.pack(fill=tk.X, pady=(4, 0))
-        self.sp_start_hr = ttk.Spinbox(sub_r, from_=6, to=12, width=5)
-        self.sp_start_hr.pack(side=tk.LEFT)
+        self._param_label(params, "Trong khung", 2)
+        hour_row = tk.Frame(params, bg=Theme.SURFACE)
+        hour_row.grid(row=2, column=1, sticky="w", pady=3)
+        self.sp_start_hr = ttk.Spinbox(hour_row, from_=0, to=23, width=4, font=Theme.FONT_BODY, command=self._find_slots)
         self.sp_start_hr.set(8)
-        tk.Label(sub_r, text="h -> ", font=Theme.FONT_BODY, fg=Theme.TEXT_MAIN, bg=Theme.BG_CARD).pack(side=tk.LEFT, padx=4)
-        self.sp_end_hr = ttk.Spinbox(sub_r, from_=13, to=23, width=5)
-        self.sp_end_hr.pack(side=tk.LEFT)
+        self.sp_start_hr.pack(side=tk.LEFT)
+        tk.Label(hour_row, text="giờ  đến", font=Theme.FONT_BODY, fg=Theme.TEXT, bg=Theme.SURFACE).pack(side=tk.LEFT, padx=6)
+        self.sp_end_hr = ttk.Spinbox(hour_row, from_=1, to=24, width=4, font=Theme.FONT_BODY, command=self._find_slots)
         self.sp_end_hr.set(21)
-        tk.Label(sub_r, text="h", font=Theme.FONT_BODY, fg=Theme.TEXT_MAIN, bg=Theme.BG_CARD).pack(side=tk.LEFT)
+        self.sp_end_hr.pack(side=tk.LEFT)
+        tk.Label(hour_row, text="giờ", font=Theme.FONT_BODY, fg=Theme.TEXT, bg=Theme.SURFACE).pack(side=tk.LEFT, padx=6)
+        for spin in (self.sp_start_hr, self.sp_end_hr):
+            spin.bind("<KeyRelease>", lambda e: self._find_slots())
 
-        c4 = tk.Frame(r2, bg=Theme.BG_CARD)
-        c4.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
-        tk.Label(c4, text="Chiến lược chọn:", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_CARD).pack(anchor="w")
-        self.cb_strat = ttk.Combobox(
-            c4,
-            values=["Sớm nhất có thể (Earliest)", "Vừa vặn nhất (Best-Fit / Giảm phân mảnh)"],
-            state="readonly",
-            font=Theme.FONT_BODY
-        )
-        self.cb_strat.pack(fill=tk.X, pady=(4, 0), ipady=2)
-        self.cb_strat.set("Sớm nhất có thể (Earliest)")
+        self._param_label(params, "Ưu tiên chọn", 3)
+        strat_col = tk.Frame(params, bg=Theme.SURFACE)
+        strat_col.grid(row=3, column=1, sticky="w", pady=3)
+        self.var_strategy = tk.StringVar(value="earliest")
+        for value, text in STRATEGIES:
+            ttk.Radiobutton(strat_col, text=text, value=value, variable=self.var_strategy, command=self._find_slots).pack(anchor="w")
 
-        # Nút tìm kiếm
-        btn_find = tk.Button(
-            container,
-            text="⚡ Phân tích & Tìm kiếm khung giờ rảnh",
-            font=Theme.FONT_HEADER,
-            bg=Theme.PRIMARY,
-            fg="white",
-            relief="flat",
-            pady=6,
-            command=self._find_slots
-        )
-        btn_find.pack(fill=tk.X, pady=(0, 12))
+        self.lbl_result = tk.Label(container, font=Theme.FONT_SUBHEADER, fg=Theme.TEXT, bg=Theme.SURFACE, anchor="w", wraplength=480, justify="left")
+        self.lbl_result.pack(fill=tk.X, pady=(14, 4))
 
-        # Bảng danh sách các khe rảnh tìm được
-        tk.Label(container, text="Danh sách các khe rảnh phù hợp:", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_DARK).pack(anchor="w", pady=(0, 4))
+        tree_frame = tk.Frame(container, bg=Theme.SURFACE, highlightthickness=1, highlightbackground=Theme.BORDER)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
 
-        tree_frame = tk.Frame(container, bg=Theme.BG_DARK)
-        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-        cols = ("slot_id", "start", "end", "duration", "rating")
-        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=6)
-        self.tree.heading("slot_id", text="STT")
-        self.tree.heading("start", text="Bắt đầu")
-        self.tree.heading("end", text="Kết thúc")
-        self.tree.heading("duration", text="Tổng rảnh")
-        self.tree.heading("rating", text="Đánh giá phù hợp")
-
-        self.tree.column("slot_id", width=45, anchor="center")
-        self.tree.column("start", width=120, anchor="center")
-        self.tree.column("end", width=120, anchor="center")
-        self.tree.column("duration", width=110, anchor="center")
-        self.tree.column("rating", width=160, anchor="w")
-
-        scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
+        cols = ("start", "end", "duration", "note")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=5, selectmode="browse")
+        for col, text, width, anchor in (
+            ("start", "Từ", 70, "center"),
+            ("end", "Đến", 70, "center"),
+            ("duration", "Còn trống", 120, "center"),
+            ("note", "Nhận xét", 220, "w")
+        ):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, anchor=anchor)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_apply_button())
+        self.tree.bind("<Double-Button-1>", lambda e: self._apply_slot())
 
-        # Hàng nút Áp dụng
-        b_bar = tk.Frame(container, bg=Theme.BG_DARK)
+        b_bar = tk.Frame(container, bg=Theme.SURFACE)
         b_bar.pack(fill=tk.X)
-
-        self.btn_apply = tk.Button(
-            b_bar,
-            text="✅ Chọn khe này & Tạo công việc",
-            font=Theme.FONT_HEADER,
-            bg=Theme.SUCCESS,
-            fg="white",
-            relief="flat",
-            pady=6,
-            state="disabled",
-            command=self._apply_slot
-        )
+        self.btn_apply = make_button(b_bar, "Tạo công việc vào giờ này", self._apply_slot, "primary", font=Theme.FONT_SUBHEADER, padx=16)
         self.btn_apply.pack(side=tk.RIGHT)
+        make_button(b_bar, "Đóng", self.destroy, padx=14).pack(side=tk.RIGHT, padx=(0, 8))
 
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self.btn_apply.config(state="normal"))
-
-        # Chạy tìm kiếm mặc định
         self._find_slots()
 
-    def _find_slots(self):
-        try:
-            target_date = datetime.strptime(self.ent_date.get().strip(), "%Y-%m-%d")
-        except ValueError:
-            messagebox.showerror("Lỗi", "Ngày không đúng định dạng YYYY-MM-DD", parent=self)
-            return
+    def _param_label(self, parent, text: str, row: int) -> None:
+        tk.Label(parent, text=text, font=Theme.FONT_SUBHEADER, fg=Theme.TEXT, bg=Theme.SURFACE, width=12, anchor="nw").grid(row=row, column=0, sticky="nw", pady=5)
 
+    def _update_apply_button(self) -> None:
+        set_button_enabled(self.btn_apply, bool(self.tree.selection()))
+
+    def _show_message(self, text: str, color: str = Theme.DANGER) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self.found_slots = []
+        self.lbl_result.configure(text=text, fg=color)
+        self._update_apply_button()
+
+    def _find_slots(self) -> None:
         try:
-            duration = int(self.ent_dur.get().strip())
+            duration = int(self.cb_duration.get().strip())
             if duration <= 0:
                 raise ValueError()
         except ValueError:
-            messagebox.showerror("Lỗi", "Thời lượng phải là số nguyên dương (phút)", parent=self)
+            self._show_message("Thời lượng phải là số phút lớn hơn 0.")
             return
 
         try:
-            sh = int(self.sp_start_hr.get())
-            eh = int(self.sp_end_hr.get())
-            if sh >= eh:
+            start_hour, end_hour = int(self.sp_start_hr.get()), int(self.sp_end_hr.get())
+            if not (0 <= start_hour < end_hour <= 24):
                 raise ValueError()
-        except Exception:
-            messagebox.showerror("Lỗi", "Giờ bắt đầu ngày phải nhỏ hơn giờ kết thúc ngày", parent=self)
+        except ValueError:
+            self._show_message("Giờ bắt đầu phải nhỏ hơn giờ kết thúc, trong khoảng từ 0 đến 24.")
             return
 
-        # Gọi thuật toán
+        day = self.date_picker.get()
+        target = datetime(day.year, day.month, day.day)
+        now = datetime.now()
+        # Với ngày hôm nay, phần thời gian đã qua không còn dùng được
+        not_before = next_round_time(now) if day == now.date() else None
+
         slots = SchedulerEngine.find_free_slots(
             self.all_tasks,
-            target_date=target_date,
-            day_start_hour=sh,
-            day_end_hour=eh,
-            min_duration_minutes=duration
+            target_date=target,
+            day_start_hour=start_hour,
+            day_end_hour=end_hour,
+            min_duration_minutes=duration,
+            not_before=not_before
         )
 
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-
+        self.duration = duration
+        self.tree.delete(*self.tree.get_children())
         self.found_slots = slots
         if not slots:
-            self.btn_apply.config(state="disabled")
-            messagebox.showinfo("Kết quả", "Không tìm thấy khung giờ rảnh nào đủ độ dài trong ngày này!", parent=self)
+            self._show_message(f"Không còn khoảng trống nào đủ {format_duration(duration)} trong khung giờ này.", Theme.WARNING)
             return
 
-        is_best_fit = "Best-Fit" in self.cb_strat.get()
-        # Tính điểm đánh giá
-        for idx, s in enumerate(slots):
-            waste = s.duration_minutes - duration
-            if is_best_fit and waste == min(s.duration_minutes - duration for s in slots):
-                eval_str = "⭐ Tối ưu Best-Fit (Ít dư nhất)"
-            elif idx == 0:
-                eval_str = "🚀 Sớm nhất trong ngày"
+        strategy = self.var_strategy.get()
+        recommended = SchedulerEngine.pick_slot(slots, duration, strategy)
+        for idx, slot in enumerate(slots):
+            leftover = slot.duration_minutes - duration
+            if slot is recommended:
+                note = "Nên chọn"
+            elif leftover == 0:
+                note = "Vừa khít"
             else:
-                eval_str = f"Dư {waste} phút rảnh"
-
+                note = f"Còn dư {format_duration(leftover)}"
             self.tree.insert("", "end", iid=str(idx), values=(
-                idx + 1,
-                s.start_time.strftime("%H:%M"),
-                s.end_time.strftime("%H:%M"),
-                f"{s.duration_minutes} phút ({s.duration_hours}h)",
-                eval_str
+                slot.start_time.strftime("%H:%M"),
+                slot.end_time.strftime("%H:%M"),
+                format_duration(slot.duration_minutes),
+                note
             ))
 
-        # Tự động chọn dòng đầu tiên
-        self.tree.selection_set("0")
-        self.btn_apply.config(state="normal")
+        self.tree.selection_set(str(slots.index(recommended)))
+        self.lbl_result.configure(
+            text=f"Tìm thấy {len(slots)} khoảng trống. Nên chọn {recommended.start_time.strftime('%H:%M')}.",
+            fg=Theme.SUCCESS
+        )
+        self._update_apply_button()
 
-    def _apply_slot(self):
+    def _apply_slot(self) -> None:
         selected = self.tree.selection()
         if not selected:
             return
-        idx = int(selected[0])
-        slot = self.found_slots[idx]
-        duration = int(self.ent_dur.get().strip())
-        slot_end = slot.start_time + timedelta(minutes=duration)
-
-        if self.on_slot_selected:
-            self.on_slot_selected(slot.start_time, slot_end, duration)
+        slot = self.found_slots[int(selected[0])]
+        slot_end = slot.start_time + timedelta(minutes=self.duration)
         self.destroy()
+        if self.on_slot_selected:
+            self.on_slot_selected(slot.start_time, slot_end, self.duration)

@@ -1,7 +1,7 @@
 """
 ui/task_dialog.py
 Hộp thoại thêm mới hoặc chỉnh sửa công việc trong lịch trình.
-Tích hợp kiểm tra xung đột thời gian thực và gợi ý khung giờ thông minh.
+Chọn ngày bằng lịch tháng, chọn việc tiên quyết bằng danh sách, tự kiểm tra xung đột ngay khi đổi thời gian.
 """
 
 import tkinter as tk
@@ -11,6 +11,9 @@ from typing import Optional, List, Callable
 from core.models import Task, Priority, Status, Category
 from core.scheduler_engine import SchedulerEngine
 from ui.theme import Theme
+from ui.widgets import DateTimeField, make_button, make_entry, make_modal, format_datetime
+
+DURATION_CHOICES = [("30 phút", 30), ("1 giờ", 60), ("2 giờ", 120), ("3 giờ", 180)]
 
 
 class TaskDialog(tk.Toplevel):
@@ -20,7 +23,8 @@ class TaskDialog(tk.Toplevel):
         all_tasks: List[Task],
         task: Optional[Task] = None,
         on_save: Optional[Callable[[Task], None]] = None,
-        default_start: Optional[datetime] = None
+        default_start: Optional[datetime] = None,
+        default_end: Optional[datetime] = None
     ):
         super().__init__(parent)
         self.parent = parent
@@ -29,301 +33,252 @@ class TaskDialog(tk.Toplevel):
         self.on_save = on_save
         self.is_edit_mode = task is not None
 
-        self.title("✏️ Chỉnh sửa công việc" if self.is_edit_mode else "➕ Thêm công việc mới")
-        self.geometry("540x680")
+        self.title("Sửa công việc" if self.is_edit_mode else "Thêm công việc")
         self.resizable(False, False)
-        self.configure(bg=Theme.BG_DARK)
+        self.configure(bg=Theme.SURFACE)
 
-        # Đặt làm cửa sổ modal
-        self.transient(parent)
-        self.grab_set()
+        self._build_ui(default_start, default_end)
+        make_modal(self, parent)
+        self.bind("<Control-s>", lambda e: self._save_action())
+        self.ent_title.focus_set()
 
-        self._build_ui(default_start)
+    def _default_times(self, default_start: Optional[datetime], default_end: Optional[datetime]):
+        if self.task:
+            return self.task.start_time, self.task.end_time
+        # Thời điểm người dùng đã chọn được giữ nguyên; nếu không chọn thì lấy đầu giờ kế tiếp
+        start = default_start or datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        return start, default_end or start + timedelta(hours=1)
 
-    def _build_ui(self, default_start: Optional[datetime]):
-        main_frame = tk.Frame(self, bg=Theme.BG_DARK, padx=24, pady=20)
+    def _label(self, parent, text: str) -> tk.Label:
+        label = tk.Label(parent, text=text, font=Theme.FONT_SUBHEADER, fg=Theme.TEXT, bg=Theme.SURFACE)
+        label.pack(anchor="w")
+        return label
+
+    def _build_ui(self, default_start: Optional[datetime], default_end: Optional[datetime]):
+        main_frame = tk.Frame(self, bg=Theme.SURFACE, padx=24, pady=18)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Tiêu đề Header
-        header_text = "CẬP NHẬT CÔNG VIỆC" if self.is_edit_mode else "THÊM CÔNG VIỆC MỚI"
-        lbl_head = tk.Label(
+        tk.Label(
             main_frame,
-            text=header_text,
+            text="Sửa công việc" if self.is_edit_mode else "Thêm công việc mới",
             font=Theme.FONT_TITLE,
-            fg=Theme.PRIMARY,
-            bg=Theme.BG_DARK
-        )
-        lbl_head.pack(anchor="w", pady=(0, 16))
+            fg=Theme.TEXT,
+            bg=Theme.SURFACE
+        ).pack(anchor="w", pady=(0, 12))
 
-        # Tiêu đề task
-        lbl_title = tk.Label(main_frame, text="Tiêu đề công việc (*):", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_DARK)
-        lbl_title.pack(anchor="w")
-        self.ent_title = tk.Entry(
-            main_frame,
-            font=Theme.FONT_BODY,
-            bg=Theme.BG_INPUT,
-            fg=Theme.TEXT_MAIN,
-            insertbackground=Theme.TEXT_MAIN,
+        # Tiêu đề
+        self._label(main_frame, "Tên công việc")
+        self.ent_title = make_entry(main_frame, width=58)
+        self.ent_title.pack(fill=tk.X, pady=(4, 12), ipady=5)
+        if self.task:
+            self.ent_title.insert(0, self.task.title)
+
+        # Thời gian
+        start_def, end_def = self._default_times(default_start, default_end)
+        self.previous_start = start_def
+
+        time_grid = tk.Frame(main_frame, bg=Theme.SURFACE)
+        time_grid.pack(fill=tk.X)
+        tk.Label(time_grid, text="Bắt đầu", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT, bg=Theme.SURFACE, width=8, anchor="w").grid(row=0, column=0, sticky="w")
+        self.field_start = DateTimeField(time_grid, start_def, self._on_start_changed)
+        self.field_start.grid(row=0, column=1, sticky="w", pady=2)
+        tk.Label(time_grid, text="Kết thúc", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT, bg=Theme.SURFACE, width=8, anchor="w").grid(row=1, column=0, sticky="w")
+        self.field_end = DateTimeField(time_grid, end_def, self._refresh_hints)
+        self.field_end.grid(row=1, column=1, sticky="w", pady=2)
+
+        chips = tk.Frame(main_frame, bg=Theme.SURFACE)
+        chips.pack(anchor="w", pady=(6, 4))
+        tk.Label(chips, text="Thời lượng nhanh:", font=Theme.FONT_SMALL, fg=Theme.TEXT_MUTED, bg=Theme.SURFACE).pack(side=tk.LEFT, padx=(0, 6))
+        for text, minutes in DURATION_CHOICES:
+            make_button(chips, text, lambda m=minutes: self._set_duration(m), font=Theme.FONT_SMALL, padx=8, pady=2).pack(side=tk.LEFT, padx=2)
+
+        self.lbl_time_status = tk.Label(main_frame, font=Theme.FONT_SMALL, bg=Theme.SURFACE, justify="left", anchor="w", wraplength=500)
+        self.lbl_time_status.pack(fill=tk.X, pady=(2, 10))
+
+        # Danh mục, ưu tiên, trạng thái
+        row = tk.Frame(main_frame, bg=Theme.SURFACE)
+        row.pack(fill=tk.X, pady=(0, 12))
+        for col in range(3):
+            row.columnconfigure(col, weight=1, uniform="fields")
+
+        self.cb_category = self._combobox(row, 0, "Danh mục", [c.label for c in Category],
+                                          self.task.category if self.task else Category.WORK.label)
+        self.cb_priority = self._combobox(row, 1, "Mức ưu tiên", [p.label for p in Priority],
+                                          self.task.priority.label if self.task else Priority.MEDIUM.label)
+        self.cb_status = self._combobox(row, 2, "Trạng thái", [s.label for s in Status],
+                                        self.task.status.label if self.task else Status.PENDING.label)
+        self.cb_status.bind("<<ComboboxSelected>>", lambda e: self._refresh_hints(), add="+")
+
+        # Việc tiên quyết
+        self._label(main_frame, "Cần xong trước (bấm để chọn, có thể chọn nhiều)")
+        dep_frame = tk.Frame(main_frame, bg=Theme.SURFACE)
+        dep_frame.pack(fill=tk.X, pady=(4, 4))
+        self.lst_deps = tk.Listbox(
+            dep_frame,
+            selectmode=tk.MULTIPLE,
+            exportselection=False,
+            height=4,
+            font=Theme.FONT_SMALL,
+            bg=Theme.SURFACE,
+            fg=Theme.TEXT,
+            selectbackground=Theme.PRIMARY_SOFT,
+            selectforeground=Theme.TEXT,
             relief="flat",
+            highlightthickness=1,
+            highlightbackground=Theme.BORDER,
+            activestyle="none"
+        )
+        dep_scroll = ttk.Scrollbar(dep_frame, orient=tk.VERTICAL, command=self.lst_deps.yview)
+        self.lst_deps.configure(yscrollcommand=dep_scroll.set)
+        self.lst_deps.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        dep_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._fill_dependency_list()
+        self.lst_deps.bind("<<ListboxSelect>>", lambda e: self._refresh_hints())
+
+        self.lbl_dep_status = tk.Label(main_frame, font=Theme.FONT_SMALL, bg=Theme.SURFACE, justify="left", anchor="w", wraplength=500)
+        self.lbl_dep_status.pack(fill=tk.X, pady=(0, 10))
+
+        # Ghi chú
+        self._label(main_frame, "Ghi chú")
+        self.txt_desc = tk.Text(
+            main_frame,
+            height=3,
+            width=10,
+            font=Theme.FONT_BODY,
+            bg=Theme.SURFACE,
+            fg=Theme.TEXT,
+            insertbackground=Theme.TEXT,
+            relief="flat",
+            wrap="word",
             highlightthickness=1,
             highlightbackground=Theme.BORDER,
             highlightcolor=Theme.PRIMARY
         )
-        self.ent_title.pack(fill=tk.X, pady=(4, 12), ipady=4)
-
-        # Hàng 2: Danh mục & Mức độ ưu tiên
-        row2 = tk.Frame(main_frame, bg=Theme.BG_DARK)
-        row2.pack(fill=tk.X, pady=(0, 12))
-
-        # Danh mục
-        col_cat = tk.Frame(row2, bg=Theme.BG_DARK)
-        col_cat.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        tk.Label(col_cat, text="Danh mục:", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_DARK).pack(anchor="w")
-        self.cb_category = ttk.Combobox(
-            col_cat,
-            values=[c.value[0] for c in Category],
-            state="readonly",
-            font=Theme.FONT_BODY
-        )
-        self.cb_category.pack(fill=tk.X, pady=(4, 0), ipady=3)
-        self.cb_category.set(self.task.category if self.task else Category.WORK.value[0])
-
-        # Độ ưu tiên
-        col_prio = tk.Frame(row2, bg=Theme.BG_DARK)
-        col_prio.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
-        tk.Label(col_prio, text="Mức độ ưu tiên:", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_DARK).pack(anchor="w")
-        self.cb_priority = ttk.Combobox(
-            col_prio,
-            values=[f"{p.level} - {p.label}" for p in Priority],
-            state="readonly",
-            font=Theme.FONT_BODY
-        )
-        self.cb_priority.pack(fill=tk.X, pady=(4, 0), ipady=3)
+        self.txt_desc.pack(fill=tk.X, pady=(4, 14))
         if self.task:
-            self.cb_priority.set(f"{self.task.priority.level} - {self.task.priority.label}")
-        else:
-            self.cb_priority.set(f"{Priority.MEDIUM.level} - {Priority.MEDIUM.label}")
-
-        # Hàng 3: Thời gian bắt đầu và kết thúc
-        row3 = tk.Frame(main_frame, bg=Theme.BG_DARK)
-        row3.pack(fill=tk.X, pady=(0, 8))
-
-        # Khởi tạo giá trị mặc định cho thời gian
-        now = default_start or datetime.now()
-        start_def = self.task.start_time if self.task else now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        end_def = self.task.end_time if self.task else start_def + timedelta(hours=1)
-
-        # Bắt đầu
-        col_start = tk.Frame(row3, bg=Theme.BG_DARK)
-        col_start.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        tk.Label(col_start, text="Bắt đầu (YYYY-MM-DD HH:MM):", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_DARK).pack(anchor="w")
-        self.ent_start = tk.Entry(col_start, font=Theme.FONT_BODY, bg=Theme.BG_INPUT, fg=Theme.TEXT_MAIN, insertbackground=Theme.TEXT_MAIN, relief="flat", highlightthickness=1, highlightbackground=Theme.BORDER)
-        self.ent_start.pack(fill=tk.X, pady=(4, 0), ipady=4)
-        self.ent_start.insert(0, start_def.strftime("%Y-%m-%d %H:%M"))
-
-        # Kết thúc
-        col_end = tk.Frame(row3, bg=Theme.BG_DARK)
-        col_end.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
-        tk.Label(col_end, text="Kết thúc (YYYY-MM-DD HH:MM):", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_DARK).pack(anchor="w")
-        self.ent_end = tk.Entry(col_end, font=Theme.FONT_BODY, bg=Theme.BG_INPUT, fg=Theme.TEXT_MAIN, insertbackground=Theme.TEXT_MAIN, relief="flat", highlightthickness=1, highlightbackground=Theme.BORDER)
-        self.ent_end.pack(fill=tk.X, pady=(4, 0), ipady=4)
-        self.ent_end.insert(0, end_def.strftime("%Y-%m-%d %H:%M"))
-
-        # Trạng thái kiểm tra xung đột thời gian thực
-        self.btn_check_conflict = tk.Button(
-            main_frame,
-            text="🔍 Kiểm tra xung đột thời gian",
-            font=Theme.FONT_SMALL,
-            bg=Theme.BG_CARD,
-            fg=Theme.INFO,
-            relief="flat",
-            activebackground=Theme.BG_CARD_HOVER,
-            command=self._check_conflict_action
-        )
-        self.btn_check_conflict.pack(anchor="w", pady=(2, 6))
-
-        self.lbl_conflict_status = tk.Label(
-            main_frame,
-            text="Chưa phát hiện xung đột thời gian",
-            font=Theme.FONT_SMALL,
-            fg=Theme.SUCCESS,
-            bg=Theme.BG_DARK
-        )
-        self.lbl_conflict_status.pack(anchor="w", pady=(0, 10))
-
-        # Hàng 4: Trạng thái & Công việc tiên quyết (Dependencies)
-        row4 = tk.Frame(main_frame, bg=Theme.BG_DARK)
-        row4.pack(fill=tk.X, pady=(0, 12))
-
-        # Trạng thái
-        col_st = tk.Frame(row4, bg=Theme.BG_DARK)
-        col_st.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        tk.Label(col_st, text="Trạng thái:", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_DARK).pack(anchor="w")
-        self.cb_status = ttk.Combobox(
-            col_st,
-            values=[s.label for s in Status],
-            state="readonly",
-            font=Theme.FONT_BODY
-        )
-        self.cb_status.pack(fill=tk.X, pady=(4, 0), ipady=3)
-        self.cb_status.set(self.task.status.label if self.task else Status.PENDING.label)
-
-        # Tiên quyết (Dependencies)
-        col_dep = tk.Frame(row4, bg=Theme.BG_DARK)
-        col_dep.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
-        tk.Label(col_dep, text="ID Tiên quyết (cách nhau dấu phẩy):", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_DARK).pack(anchor="w")
-        self.ent_dep = tk.Entry(col_dep, font=Theme.FONT_BODY, bg=Theme.BG_INPUT, fg=Theme.TEXT_MAIN, insertbackground=Theme.TEXT_MAIN, relief="flat", highlightthickness=1, highlightbackground=Theme.BORDER)
-        self.ent_dep.pack(fill=tk.X, pady=(4, 0), ipady=4)
-        if self.task and self.task.dependencies:
-            self.ent_dep.insert(0, ", ".join(self.task.dependencies))
-
-        # Mô tả chi tiết
-        tk.Label(main_frame, text="Mô tả / Ghi chú:", font=Theme.FONT_SUBHEADER, fg=Theme.TEXT_MAIN, bg=Theme.BG_DARK).pack(anchor="w")
-        self.txt_desc = tk.Text(
-            main_frame,
-            height=4,
-            font=Theme.FONT_BODY,
-            bg=Theme.BG_INPUT,
-            fg=Theme.TEXT_MAIN,
-            insertbackground=Theme.TEXT_MAIN,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=Theme.BORDER
-        )
-        self.txt_desc.pack(fill=tk.BOTH, expand=True, pady=(4, 16))
-
-        # Đổ dữ liệu cũ nếu đang sửa
-        if self.task:
-            self.ent_title.insert(0, self.task.title)
             self.txt_desc.insert("1.0", self.task.description)
 
-        # Hàng nút bấm Hành động
-        btn_bar = tk.Frame(main_frame, bg=Theme.BG_DARK)
+        # Hàng nút
+        btn_bar = tk.Frame(main_frame, bg=Theme.SURFACE)
         btn_bar.pack(fill=tk.X)
+        self.lbl_error = tk.Label(btn_bar, font=Theme.FONT_SMALL, fg=Theme.DANGER, bg=Theme.SURFACE, anchor="w", wraplength=300, justify="left")
+        self.lbl_error.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        make_button(btn_bar, "Lưu công việc", self._save_action, "primary", font=Theme.FONT_SUBHEADER, padx=18).pack(side=tk.RIGHT)
+        make_button(btn_bar, "Hủy bỏ", self.destroy, padx=14).pack(side=tk.RIGHT, padx=(0, 8))
 
-        btn_cancel = tk.Button(
-            btn_bar,
-            text="Hủy bỏ",
-            font=Theme.FONT_BODY,
-            bg=Theme.BG_CARD,
-            fg=Theme.TEXT_MUTED,
-            relief="flat",
-            padx=16,
-            pady=6,
-            command=self.destroy
-        )
-        btn_cancel.pack(side=tk.RIGHT, padx=(8, 0))
+        self._refresh_hints()
 
-        btn_save = tk.Button(
-            btn_bar,
-            text="Lưu công việc",
-            font=Theme.FONT_BODY,
-            bg=Theme.PRIMARY,
-            fg="white",
-            relief="flat",
-            padx=20,
-            pady=6,
-            command=self._save_action
-        )
-        btn_save.pack(side=tk.RIGHT)
+    def _combobox(self, parent, col: int, label: str, values: List[str], current: str) -> ttk.Combobox:
+        frame = tk.Frame(parent, bg=Theme.SURFACE)
+        frame.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0))
+        self._label(frame, label)
+        combo = ttk.Combobox(frame, values=values, state="readonly", font=Theme.FONT_BODY, width=12)
+        combo.pack(fill=tk.X, pady=(4, 0))
+        combo.set(current)
+        return combo
 
-        # Chạy kiểm tra xung đột ban đầu
-        self._check_conflict_action()
+    def _fill_dependency_list(self) -> None:
+        current = set(self.task.dependencies) if self.task else set()
+        candidates = [
+            t for t in sorted(self.all_tasks, key=lambda t: t.start_time)
+            if (not self.task or t.id != self.task.id) and (t.status.name != "CANCELLED" or t.id in current)
+        ]
+        self.dep_candidates = candidates
+        for index, t in enumerate(candidates):
+            self.lst_deps.insert(tk.END, f"{format_datetime(t.start_time)}  ·  {t.title}")
+            if t.id in current:
+                self.lst_deps.selection_set(index)
 
-    def _parse_inputs(self) -> Optional[Task]:
-        title = self.ent_title.get().strip()
-        if not title:
-            messagebox.showerror("Thiếu thông tin", "Vui lòng nhập tiêu đề công việc!", parent=self)
+    def _selected_dependencies(self) -> List[str]:
+        return [self.dep_candidates[i].id for i in self.lst_deps.curselection()]
+
+    def _on_start_changed(self) -> None:
+        """Dời giờ bắt đầu thì giữ nguyên thời lượng công việc."""
+        new_start = self.field_start.get()
+        end = self.field_end.get()
+        if new_start and end and self.previous_start:
+            self.field_end.set(end + (new_start - self.previous_start))
+        if new_start:
+            self.previous_start = new_start
+        self._refresh_hints()
+
+    def _set_duration(self, minutes: int) -> None:
+        start = self.field_start.get()
+        if start:
+            self.field_end.set(start + timedelta(minutes=minutes))
+            self._refresh_hints()
+
+    def _build_candidate(self) -> Optional[Task]:
+        """Tạo đối tượng công việc từ dữ liệu đang nhập; trả về None nếu thời gian chưa hợp lệ."""
+        start, end = self.field_start.get(), self.field_end.get()
+        if not start or not end or end <= start:
             return None
-
-        # Đọc thời gian
-        try:
-            start_time = datetime.strptime(self.ent_start.get().strip(), "%Y-%m-%d %H:%M")
-        except ValueError:
-            messagebox.showerror("Lỗi định dạng", "Thời gian bắt đầu không hợp lệ (Định dạng: YYYY-MM-DD HH:MM)", parent=self)
-            return None
-
-        try:
-            end_time = datetime.strptime(self.ent_end.get().strip(), "%Y-%m-%d %H:%M")
-        except ValueError:
-            messagebox.showerror("Lỗi định dạng", "Thời gian kết thúc không hợp lệ (Định dạng: YYYY-MM-DD HH:MM)", parent=self)
-            return None
-
-        if end_time <= start_time:
-            messagebox.showerror("Lỗi logic", "Thời gian kết thúc phải diễn ra sau thời gian bắt đầu!", parent=self)
-            return None
-
-        # Priority
-        prio_str = self.cb_priority.get().split(" - ")[-1]
-        priority = Priority.from_string(prio_str)
-
-        # Status
-        status_str = self.cb_status.get()
-        status = Status.from_string(status_str)
-
-        # Category
-        cat_str = self.cb_category.get()
-
-        # Dependencies
-        raw_deps = self.ent_dep.get().strip()
-        deps = [d.strip() for d in raw_deps.split(",") if d.strip()] if raw_deps else []
-
-        description = self.txt_desc.get("1.0", tk.END).strip()
-
-        task_id = self.task.id if self.task else None
-        created_at = self.task.created_at if self.task else None
-
         return Task(
-            id=task_id,
-            title=title,
-            start_time=start_time,
-            end_time=end_time,
-            category=cat_str,
-            priority=priority,
-            status=status,
-            dependencies=deps,
-            description=description,
-            created_at=created_at
+            id=self.task.id if self.task else None,
+            title=self.ent_title.get().strip() or "Công việc này",
+            start_time=start,
+            end_time=end,
+            category=self.cb_category.get(),
+            priority=Priority.from_string(self.cb_priority.get()),
+            status=Status.from_string(self.cb_status.get()),
+            dependencies=self._selected_dependencies(),
+            description=self.txt_desc.get("1.0", tk.END).strip(),
+            created_at=self.task.created_at if self.task else None
         )
 
-    def _check_conflict_action(self):
-        try:
-            start_time = datetime.strptime(self.ent_start.get().strip(), "%Y-%m-%d %H:%M")
-            end_time = datetime.strptime(self.ent_end.get().strip(), "%Y-%m-%d %H:%M")
-            if end_time <= start_time:
-                self.lbl_conflict_status.config(text="⚠️ Giờ kết thúc <= giờ bắt đầu", fg=Theme.DANGER)
-                return
-
-            candidate = Task(
-                id=self.task.id if self.task else "TEMP",
-                title="Temp",
-                start_time=start_time,
-                end_time=end_time
-            )
-            conflicts = SchedulerEngine.detect_conflicts_for_task(candidate, self.all_tasks)
-            if conflicts:
-                msg = f"⚠️ Xung đột với {len(conflicts)} việc: " + ", ".join([f"'{c.task2.title}'" for c in conflicts[:2]])
-                if len(conflicts) > 2:
-                    msg += f" và {len(conflicts)-2} việc khác"
-                self.lbl_conflict_status.config(text=msg, fg=Theme.WARNING)
-            else:
-                self.lbl_conflict_status.config(text="✅ Không phát hiện xung đột thời gian", fg=Theme.SUCCESS)
-        except Exception:
-            self.lbl_conflict_status.config(text="ℹ️ Hãy nhập đúng định dạng ngày giờ để kiểm tra", fg=Theme.TEXT_MUTED)
-
-    def _save_action(self):
-        task = self._parse_inputs()
-        if not task:
+    def _refresh_hints(self) -> None:
+        """Cập nhật thông báo về thời gian và việc tiên quyết ngay khi người dùng thay đổi."""
+        self.lbl_error.configure(text="")
+        candidate = self._build_candidate()
+        if candidate is None:
+            start, end = self.field_start.get(), self.field_end.get()
+            text = "Giờ hoặc phút chưa hợp lệ." if not start or not end else "Giờ kết thúc phải sau giờ bắt đầu."
+            self.lbl_time_status.configure(text=text, fg=Theme.DANGER)
+            self.lbl_dep_status.configure(text="")
             return
 
-        # Cảnh báo nếu vẫn còn xung đột
+        conflicts = SchedulerEngine.detect_conflicts_for_task(candidate, self.all_tasks)
+        if conflicts:
+            names = ", ".join(f"'{c.task2.title}'" for c in conflicts[:2])
+            more = f" và {len(conflicts) - 2} việc khác" if len(conflicts) > 2 else ""
+            self.lbl_time_status.configure(text=f"Trùng giờ với {names}{more}.", fg=Theme.WARNING)
+        else:
+            self.lbl_time_status.configure(text="Không trùng giờ với việc nào.", fg=Theme.SUCCESS)
+
+        errors = SchedulerEngine.validate_dependencies(candidate, self.all_tasks)
+        if errors:
+            self.lbl_dep_status.configure(text=errors[0], fg=Theme.DANGER)
+            return
+        task_map = {t.id: t for t in self.all_tasks}
+        early = [task_map[d].title for d in candidate.dependencies if candidate.start_time < task_map[d].end_time]
+        if early:
+            self.lbl_dep_status.configure(text=f"Lưu ý: việc này bắt đầu trước khi '{early[0]}' kết thúc.", fg=Theme.WARNING)
+        else:
+            self.lbl_dep_status.configure(text="")
+
+    def _save_action(self):
+        if not self.ent_title.get().strip():
+            self.lbl_error.configure(text="Vui lòng nhập tên công việc.")
+            self.ent_title.focus_set()
+            return
+
+        task = self._build_candidate()
+        if task is None:
+            self.lbl_error.configure(text="Vui lòng sửa lại thời gian.")
+            return
+
+        errors = SchedulerEngine.validate_dependencies(task, self.all_tasks)
+        if errors:
+            self.lbl_error.configure(text=errors[0])
+            return
+
         conflicts = SchedulerEngine.detect_conflicts_for_task(task, self.all_tasks)
         if conflicts:
+            first = conflicts[0]
             confirm = messagebox.askyesno(
-                "Xác nhận xung đột",
-                f"Công việc này đang bị trùng lịch với {len(conflicts)} công việc khác.\n"
-                f"Ví dụ: '{conflicts[0].task2.title}' ({conflicts[0].overlap_minutes} phút trùng).\n\n"
-                f"Bạn có chắc chắn muốn lưu lại không?",
+                "Trùng lịch",
+                f"Công việc này trùng giờ với {len(conflicts)} việc khác, "
+                f"ví dụ '{first.task2.title}' ({first.overlap_minutes} phút).\n\nVẫn lưu chứ?",
                 parent=self
             )
             if not confirm:

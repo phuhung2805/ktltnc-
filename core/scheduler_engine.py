@@ -1,16 +1,19 @@
 """
 core/scheduler_engine.py
 Module chứa các thuật toán cốt lõi xử lý lịch trình:
-1. Sweep-line: Phát hiện xung đột thời gian (Conflict Detection) O(N log N)
+1. Sắp xếp và quét dừng sớm: Phát hiện xung đột thời gian (Conflict Detection) O(N log N + K)
 2. Interval Merging & Inversion: Tìm khoảng thời gian rảnh tối ưu (Smart Free Slot Finder) O(N log N)
 3. Kahn's Algorithm: Lập lịch và phát hiện chu trình phụ thuộc công việc (Topological Sort) O(V + E)
 4. Dynamic Programming: Lập lịch tối ưu có trọng số (Weighted Interval Scheduling) O(N log N)
 5. Phân loại ma trận Eisenhower & Đánh giá mức độ ưu tiên
+6. Phân làn khoảng thời gian (Interval Partitioning): Xếp các việc trùng giờ trên lịch tuần O(N log N)
 """
 
-from datetime import datetime, timedelta, time
-from typing import List, Tuple, Dict, Optional, Set
+from collections import deque
+from datetime import datetime, timedelta
+from typing import List, Tuple, Dict, Optional
 import bisect
+import heapq
 from core.models import Task, Priority, Status
 
 
@@ -44,6 +47,18 @@ class FreeTimeSlot:
         return f"FreeSlot({self.start_time.strftime('%Y-%m-%d %H:%M')} -> {self.end_time.strftime('%H:%M')}, {self.duration_minutes}m)"
 
 
+class RescheduleMove:
+    """Phương án dời một công việc sang khung giờ mới; blocked_titles là các việc phụ thuộc bị ảnh hưởng."""
+    def __init__(self, task: Task, new_start: datetime, new_end: datetime, blocked_titles: List[str]):
+        self.task = task
+        self.new_start = new_start
+        self.new_end = new_end
+        self.blocked_titles = blocked_titles
+
+    def __repr__(self):
+        return f"Move('{self.task.title}' -> {self.new_start.strftime('%d/%m %H:%M')})"
+
+
 class SchedulerEngine:
     """
     Bộ máy thực thi các thuật toán lập lịch nâng cao.
@@ -53,28 +68,34 @@ class SchedulerEngine:
     def detect_conflicts_for_task(candidate: Task, tasks: List[Task]) -> List[ConflictResult]:
         """
         Kiểm tra xung đột giữa một công việc ứng viên với danh sách các công việc hiện có.
+        Chỉ các công việc còn phải làm mới chiếm chỗ; việc đã hoàn thành hoặc đã hủy được bỏ qua.
         Độ phức tạp: O(N)
         """
+        if not candidate.is_active:
+            return []
+
         conflicts = []
         for task in tasks:
-            if task.id != candidate.id and candidate.is_overlapping_with(task):
+            if task.is_active and task.id != candidate.id and candidate.is_overlapping_with(task):
                 conflicts.append(ConflictResult(candidate, task))
         return conflicts
 
     @staticmethod
     def detect_all_conflicts(tasks: List[Task]) -> List[ConflictResult]:
         """
-        Thuật toán Sweep-Line (Đường quét) phát hiện toàn bộ các cặp công việc xung đột.
+        Phát hiện toàn bộ các cặp công việc xung đột bằng cách sắp xếp rồi quét, dừng sớm (kiểu Sweep-Line).
         Ý tưởng:
-        1. Sắp xếp các sự kiện bắt đầu và kết thúc của các công việc theo mốc thời gian O(N log N).
-        2. Duyệt qua các công việc đã sắp xếp theo start_time, sử dụng danh sách active intervals.
-        Độ phức tạp: O(N log N + K) với K là số lượng xung đột thực tế.
+        1. Sắp xếp các công việc theo start_time: O(N log N).
+        2. Với mỗi công việc i, chỉ xét các công việc kế tiếp cho đến công việc đầu tiên bắt đầu
+           từ end_time của i trở đi. Mỗi bước không dừng đều tạo ra đúng một cặp xung đột.
+        Độ phức tạp: O(N log N + K) với K là số cặp xung đột thực tế.
+        Lưu ý: K có thể lên tới N(N-1)/2, nên trường hợp xấu nhất vẫn là O(N^2).
         """
         if len(tasks) < 2:
             return []
 
-        # Chỉ xét các công việc chưa bị hủy
-        valid_tasks = [t for t in tasks if t.status != Status.CANCELLED]
+        # Chỉ xét các công việc còn phải làm
+        valid_tasks = [t for t in tasks if t.is_active]
         # Sắp xếp theo start_time
         sorted_tasks = sorted(valid_tasks, key=lambda t: t.start_time)
 
@@ -125,7 +146,8 @@ class SchedulerEngine:
         target_date: datetime,
         day_start_hour: int = 8,
         day_end_hour: int = 21,
-        min_duration_minutes: int = 30
+        min_duration_minutes: int = 30,
+        not_before: Optional[datetime] = None
     ) -> List[FreeTimeSlot]:
         """
         Thuật toán tìm các khoảng thời gian trống (Free Slots) trong một ngày cụ thể.
@@ -134,10 +156,13 @@ class SchedulerEngine:
         2. Hợp nhất các khoảng thời gian bận (busy intervals).
         3. Thực hiện phép bù (Inversion) so với toàn bộ khung giờ làm việc [day_start, day_end].
         4. Lọc các khe có độ dài >= min_duration_minutes.
+        Tham số not_before bỏ qua phần thời gian đã trôi qua. day_end_hour = 24 nghĩa là hết ngày.
+        Việc đã hoàn thành vẫn tính là bận vì khoảng thời gian đó đã được dùng; chỉ việc đã hủy mới trả lại chỗ.
         Độ phức tạp: O(N log N)
         """
-        day_start = datetime(target_date.year, target_date.month, target_date.day, day_start_hour, 0)
-        day_end = datetime(target_date.year, target_date.month, target_date.day, day_end_hour, 0)
+        midnight = datetime(target_date.year, target_date.month, target_date.day)
+        day_start = midnight + timedelta(hours=day_start_hour)
+        day_end = midnight + timedelta(hours=day_end_hour)
 
         # Trích xuất các khoảng bận rộn nằm trong ngày
         busy_intervals: List[Tuple[datetime, datetime]] = []
@@ -157,7 +182,7 @@ class SchedulerEngine:
 
         # Đảo ngược khoảng bận để lấy khoảng rảnh
         free_slots: List[FreeTimeSlot] = []
-        current_cursor = day_start
+        current_cursor = max(day_start, not_before) if not_before else day_start
 
         for busy_start, busy_end in merged_busy:
             if busy_start > current_cursor:
@@ -172,6 +197,20 @@ class SchedulerEngine:
                 free_slots.append(FreeTimeSlot(current_cursor, day_end))
 
         return free_slots
+
+    @staticmethod
+    def pick_slot(slots: List[FreeTimeSlot], duration_minutes: int, strategy: str = "earliest") -> Optional[FreeTimeSlot]:
+        """
+        Chọn khe rảnh theo chiến lược trong các khe đủ dài:
+        - 'earliest': Khe sớm nhất.
+        - 'best_fit': Khe có phần dư (độ dài - duration_minutes) nhỏ nhất; nếu bằng nhau lấy khe sớm hơn.
+        """
+        fitting = [s for s in slots if s.duration_minutes >= duration_minutes]
+        if not fitting:
+            return None
+        if strategy == "best_fit":
+            return min(fitting, key=lambda s: s.duration_minutes - duration_minutes)
+        return fitting[0]
 
     @classmethod
     def suggest_optimal_slot(
@@ -196,21 +235,10 @@ class SchedulerEngine:
             min_duration_minutes=duration_minutes
         )
 
-        if not free_slots:
+        best_slot = cls.pick_slot(free_slots, duration_minutes, strategy)
+        if best_slot is None:
             return None
-
-        if strategy == "best_fit":
-            # Best fit: Khe rảnh có (duration - required) nhỏ nhất nhưng >= 0
-            best_slot = min(free_slots, key=lambda s: s.duration_minutes - duration_minutes)
-            slot_start = best_slot.start_time
-            slot_end = slot_start + timedelta(minutes=duration_minutes)
-            return (slot_start, slot_end)
-        else:
-            # Earliest: Khe đầu tiên
-            best_slot = free_slots[0]
-            slot_start = best_slot.start_time
-            slot_end = slot_start + timedelta(minutes=duration_minutes)
-            return (slot_start, slot_end)
+        return (best_slot.start_time, best_slot.start_time + timedelta(minutes=duration_minutes))
 
     @staticmethod
     def topological_sort(tasks: List[Task]) -> Tuple[List[Task], List[str]]:
@@ -234,12 +262,11 @@ class SchedulerEngine:
                     in_degree[task.id] += 1
 
         # Hàng đợi các đỉnh có bán bậc vào (in_degree) = 0
-        queue = [tid for tid, deg in in_degree.items() if deg == 0]
+        queue = deque(tid for tid, deg in in_degree.items() if deg == 0)
         sorted_task_ids = []
 
         while queue:
-            # Có thể ưu tiên lấy task theo độ ưu tiên cao trước
-            current_id = queue.pop(0)
+            current_id = queue.popleft()
             sorted_task_ids.append(current_id)
 
             for neighbor_id in adj_list[current_id]:
@@ -269,11 +296,61 @@ class SchedulerEngine:
         return sorted_tasks, warnings
 
     @staticmethod
+    def validate_dependencies(task: Task, tasks: List[Task]) -> List[str]:
+        """
+        Kiểm tra các công việc tiên quyết của task trước khi lưu: tự phụ thuộc, mã không tồn tại
+        và chu trình (duyệt DFS từ task theo cạnh tiên quyết xem có quay lại chính nó không).
+        Trả về danh sách lỗi, rỗng nếu hợp lệ. Độ phức tạp: O(V + E).
+        """
+        task_map = {t.id: t for t in tasks}
+        errors: List[str] = []
+
+        if task.id in task.dependencies:
+            errors.append(f"Công việc '{task.title}' không thể là tiên quyết của chính nó.")
+
+        missing = [d for d in task.dependencies if d not in task_map and d != task.id]
+        if missing:
+            errors.append(f"Không tìm thấy công việc tiên quyết có mã: {', '.join(missing)}.")
+
+        visited = set()
+        stack = [d for d in task.dependencies if d != task.id]
+        while stack:
+            current_id = stack.pop()
+            if current_id == task.id:
+                errors.append(f"Lựa chọn này tạo chu trình phụ thuộc: '{task.title}' đang là tiên quyết của một việc trong danh sách.")
+                break
+            if current_id in visited or current_id not in task_map:
+                continue
+            visited.add(current_id)
+            stack.extend(task_map[current_id].dependencies)
+
+        return errors
+
+    @staticmethod
+    def unfinished_prerequisites(task: Task, tasks: List[Task]) -> List[Task]:
+        """Danh sách các công việc tiên quyết của task chưa hoàn thành (việc đã hủy không còn chặn)."""
+        task_map = {t.id: t for t in tasks}
+        prerequisites = [task_map[d] for d in task.dependencies if d in task_map]
+        return [t for t in prerequisites if t.is_active]
+
+    @staticmethod
+    def task_weight(task: Task) -> float:
+        """
+        Trọng số của công việc trong bài toán WIS: w = 10 * 3^(p - 1) + max(1, 120 / max(30, d)).
+        Phần đầu tăng theo cấp số nhân để một việc ưu tiên cao không bị nhiều việc ưu tiên thấp hơn
+        một bậc lấn át (1 việc Khẩn cấp thắng 2 việc Cao); phần sau (từ 1 đến 4) nhỉnh hơn cho việc ngắn.
+        """
+        base = 10.0 * 3 ** (task.priority.level - 1)
+        duration_factor = max(1.0, 120.0 / max(30, task.duration_minutes))
+        return round(base + duration_factor, 2)
+
+    @staticmethod
     def weighted_interval_scheduling(tasks: List[Task]) -> Tuple[float, List[Task]]:
         """
         Thuật toán Quy hoạch động (Dynamic Programming) giải bài toán Weighted Interval Scheduling:
         Cho N công việc có khung giờ [si, ei) và trọng số vi (dựa trên Priority & Urgency).
         Chọn tập công việc tương thích (không xung đột thời gian) sao cho tổng trọng số là lớn nhất.
+        Chỉ xét các công việc còn phải làm, vì việc đã xong hoặc đã hủy không cần giành chỗ nữa.
 
         Công thức truy hồi:
         OPT(j) = max(v_j + OPT(p(j)), OPT(j - 1))
@@ -283,16 +360,11 @@ class SchedulerEngine:
         if not tasks:
             return 0.0, []
 
-        valid_tasks = [t for t in tasks if t.status != Status.CANCELLED]
+        valid_tasks = [t for t in tasks if t.is_active]
         if not valid_tasks:
             return 0.0, []
 
-        # Tính trọng số cho từng công việc: Trọng số = Priority * 10 + (24 / duration)
-        # Ưu tiên công việc quan trọng và gọn gàng
-        def compute_weight(t: Task) -> float:
-            base = t.priority.level * 10.0
-            duration_factor = max(1.0, 120.0 / max(30, t.duration_minutes))
-            return round(base + duration_factor, 2)
+        compute_weight = SchedulerEngine.task_weight
 
         # 1. Sắp xếp các công việc theo thời gian kết thúc tăng dần
         sorted_tasks = sorted(valid_tasks, key=lambda t: t.end_time)
@@ -330,8 +402,110 @@ class SchedulerEngine:
         selected_tasks.reverse()
         return dp[n], selected_tasks
 
+    @classmethod
+    def plan_conflict_resolution(
+        cls,
+        tasks: List[Task],
+        now: Optional[datetime] = None,
+        day_start_hour: int = 8,
+        day_end_hour: int = 21,
+        horizon_days: int = 14
+    ) -> Tuple[List[RescheduleMove], List[Task]]:
+        """
+        Lập phương án gỡ trùng lịch, kết hợp quy hoạch động với tìm khe rảnh:
+        1. Dùng WIS để xác định các việc được giữ nguyên giờ.
+        2. Duyệt các việc còn lại theo ưu tiên giảm dần, đặt mỗi việc vào khe rảnh sớm nhất
+           không trước giờ cũ, không trước thời điểm hiện tại và sau khi các việc tiên quyết kết thúc.
+        Đầu ra: danh sách phương án dời và các việc không xếp được trong horizon_days ngày.
+        Độ phức tạp: O(D * H * N log N) với D là số việc phải dời, H là số ngày tìm kiếm.
+        """
+        now = now or datetime.now()
+        _, kept = cls.weighted_interval_scheduling(tasks)
+        kept_ids = {t.id for t in kept}
+        task_map = {t.id: t for t in tasks}
+        dropped = sorted(
+            (t for t in tasks if t.is_active and t.id not in kept_ids),
+            key=lambda t: (-t.priority.level, t.start_time)
+        )
+
+        # Việc đã hoàn thành không chiếm chỗ trong tương lai nên chỉ các việc được giữ mới tính là bận
+        busy = list(kept)
+        planned_end: Dict[str, datetime] = {}
+        moves: List[RescheduleMove] = []
+        unplaced: List[Task] = []
+
+        for task in dropped:
+            earliest = max(task.start_time, now)
+            for dep_id in task.dependencies:
+                dep = task_map.get(dep_id)
+                if dep is not None and dep.is_active:
+                    earliest = max(earliest, planned_end.get(dep_id, dep.end_time))
+
+            placed = None
+            for offset in range(horizon_days):
+                day = earliest + timedelta(days=offset)
+                slots = cls.find_free_slots(
+                    busy, day, day_start_hour, day_end_hour,
+                    min_duration_minutes=task.duration_minutes, not_before=earliest
+                )
+                placed = cls.pick_slot(slots, task.duration_minutes, "earliest")
+                if placed is not None:
+                    break
+
+            if placed is None:
+                unplaced.append(task)
+                continue
+
+            new_end = placed.start_time + timedelta(minutes=task.duration_minutes)
+            busy.append(Task(title=task.title, id=task.id, start_time=placed.start_time, end_time=new_end))
+            planned_end[task.id] = new_end
+            blocked = [t.title for t in tasks if task.id in t.dependencies and t.is_active and t.start_time < new_end]
+            moves.append(RescheduleMove(task, placed.start_time, new_end, blocked))
+
+        return moves, unplaced
+
     @staticmethod
-    def classify_eisenhower(tasks: List[Task], threshold_hours: float = 24.0) -> Dict[str, List[Task]]:
+    def assign_overlap_lanes(tasks: List[Task]) -> Dict[str, Tuple[int, int]]:
+        """
+        Phân làn để vẽ các việc trùng giờ cạnh nhau trên lịch (Interval Partitioning):
+        duyệt theo start_time, dùng min-heap theo end_time để tái sử dụng làn sớm rảnh nhất.
+        Các việc nối nhau bằng quan hệ trùng giờ tạo thành một cụm và chia chung số làn.
+        Đầu ra: task.id -> (chỉ số làn, tổng số làn của cụm). Độ phức tạp: O(N log N).
+        """
+        result: Dict[str, Tuple[int, int]] = {}
+        cluster: List[Tuple[str, int]] = []
+        cluster_end: Optional[datetime] = None
+        heap: List[Tuple[datetime, int]] = []
+        lane_count = 0
+
+        def _flush():
+            for task_id, lane in cluster:
+                result[task_id] = (lane, lane_count)
+
+        for t in sorted(tasks, key=lambda t: (t.start_time, t.end_time)):
+            if cluster and t.start_time >= cluster_end:
+                _flush()
+                cluster, heap, lane_count, cluster_end = [], [], 0, None
+
+            if heap and heap[0][0] <= t.start_time:
+                _, lane = heapq.heappop(heap)
+            else:
+                lane = lane_count
+                lane_count += 1
+
+            heapq.heappush(heap, (t.end_time, lane))
+            cluster.append((t.id, lane))
+            cluster_end = t.end_time if cluster_end is None else max(cluster_end, t.end_time)
+
+        _flush()
+        return result
+
+    @staticmethod
+    def classify_eisenhower(
+        tasks: List[Task],
+        threshold_hours: float = 24.0,
+        now: Optional[datetime] = None
+    ) -> Dict[str, List[Task]]:
         """
         Phân loại công việc theo Ma trận Eisenhower (4 Góc phần tư):
         - Q1 (Khẩn cấp & Quan trọng): Priority >= HIGH và thời gian bắt đầu trong vòng `threshold_hours` giờ.
@@ -339,7 +513,7 @@ class SchedulerEngine:
         - Q3 (Khẩn cấp & Ít quan trọng): Priority < HIGH và thời gian bắt đầu trong vòng `threshold_hours`.
         - Q4 (Không khẩn cấp & Ít quan trọng): Priority < HIGH và thời gian bắt đầu > `threshold_hours`.
         """
-        now = datetime.now()
+        now = now or datetime.now()
         quadrants: Dict[str, List[Task]] = {
             "Q1": [],  # Làm ngay
             "Q2": [],  # Lên kế hoạch
