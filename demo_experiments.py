@@ -34,7 +34,7 @@ def run_all_experiments():
         print(f"{t.id:<6}{t.title[:33]:<35}{t.category:<12}{t.priority.label:<10}{t.start_time.strftime('%d/%m %H:%M'):<14}{t.end_time.strftime('%d/%m %H:%M'):<14}")
 
     # 2. Thực nghiệm Phát hiện Xung đột Lịch trình
-    print_section("2. THỬ NGHIỆM PHÁT HIỆN XUNG ĐỘT (SWEEP-LINE CONFLICT DETECTION)")
+    print_section("2. THỬ NGHIỆM PHÁT HIỆN XUNG ĐỘT (SẮP XẾP VÀ QUÉT DỪNG SỚM)")
     conflicts = SchedulerEngine.detect_all_conflicts(tasks)
     print(f"-> Thuật toán quét và phát hiện thấy {len(conflicts)} cặp công việc xung đột thời gian:")
     for idx, c in enumerate(conflicts, 1):
@@ -91,7 +91,8 @@ def run_all_experiments():
     print_section("5. THỬ NGHIỆM QUY HOẠCH ĐỘNG LẬP LỊCH TỐI ƯU CÓ TRỌNG SỐ (WIS - DP)")
     max_weight, optimal_subset = SchedulerEngine.weighted_interval_scheduling(tasks)
     print(f"-> Đã tìm được tập con công việc KHÔNG XUNG ĐỘT tối ưu với tổng trọng số: {max_weight:.2f}")
-    print(f"   Số lượng công việc được chọn: {len(optimal_subset)} / {len(tasks)} công việc ban đầu.")
+    active_count = sum(1 for t in tasks if t.is_active)
+    print(f"   Số lượng công việc được chọn: {len(optimal_subset)} / {active_count} công việc còn phải làm (bỏ qua việc đã hoàn thành).")
     print(f"   {'Mã':<6}{'Tiêu đề':<38}{'Ưu tiên':<12}{'Khung giờ':<22}{'Thời lượng'}")
     print("   " + "-" * 85)
     for t in optimal_subset:
@@ -100,7 +101,10 @@ def run_all_experiments():
 
     # 6. Thực nghiệm Phân loại Ma trận Eisenhower
     print_section("6. THỬ NGHIỆM PHÂN LOẠI MA TRẬN EISENHOWER (4 GÓC PHẦN TƯ)")
-    quadrants = SchedulerEngine.classify_eisenhower(tasks, threshold_hours=24.0)
+    # Cố định thời điểm hiện tại để kết quả lặp lại được: 07:00 của ngày đầu tiên
+    demo_now = base_date.replace(hour=7)
+    print(f"-> Giả định thời điểm hiện tại là {demo_now.strftime('%H:%M %d/%m/%Y')}.")
+    quadrants = SchedulerEngine.classify_eisenhower(tasks, threshold_hours=24.0, now=demo_now)
     names = {
         "Q1": "Góc Q1: Khẩn cấp & Quan trọng (Làm ngay)",
         "Q2": "Góc Q2: Quan trọng & Không khẩn cấp (Lên kế hoạch)",
@@ -113,7 +117,7 @@ def run_all_experiments():
             print(f"     • [{t.id}] {t.title} ({t.category}, Ưu tiên: {t.priority.label})")
 
     print("\n" + "=" * 80)
-    print("      TẤT CẢ CÁC BƯỚC THỬ NGHIỆM ĐÃ HOÀN THÀNH XUẤT SẮC!")
+    print("      ĐÃ CHẠY XONG TẤT CẢ CÁC BƯỚC THỬ NGHIỆM.")
     print("=" * 80)
 
 

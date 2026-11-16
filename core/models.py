@@ -107,6 +107,11 @@ class Task:
         """Thời lượng tính theo giờ."""
         return round(self.duration_minutes / 60.0, 2)
 
+    @property
+    def is_active(self) -> bool:
+        """Công việc còn phải làm (chưa hoàn thành và chưa bị hủy)."""
+        return self.status in (Status.PENDING, Status.IN_PROGRESS)
+
     def is_overlapping_with(self, other: 'Task') -> bool:
         """
         Kiểm tra 2 công việc có giao thoa về mặt thời gian hay không.
@@ -120,7 +125,7 @@ class Task:
     def is_overdue(self, current_time: Optional[datetime] = None) -> bool:
         """Kiểm tra công việc đã quá hạn chưa."""
         now = current_time or datetime.now()
-        return self.status != Status.COMPLETED and self.end_time < now
+        return self.is_active and self.end_time < now
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển đổi thành từ điển JSON-serializable."""

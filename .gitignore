@@ -31,3 +31,6 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# Visual Studio
+.vs/
